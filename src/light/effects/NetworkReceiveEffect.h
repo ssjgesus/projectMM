@@ -25,15 +25,14 @@ namespace mm {
 // find nodes by broadcasting ArtPoll; this effect answers with ArtPollReply so
 // the device appears in their node lists instead of needing manual IP entry.
 //
-// The layer clears its buffer at the start of every tick, so packets are
-// drained into an owned STAGING buffer and staging is copied to the layer
-// buffer each tick — hold-last-frame semantics; without it the lights would
-// strobe black between frames. The drain is non-blocking and bounded per tick
-// (network input is synchronous at the frame boundary — the architecture.md
-// rule), so a packet flood can't wedge the render loop. Sequence fields are
-// ignored. DDP frame boundaries use offset zero and the push flag so bytes not
-// refreshed by a later frame are cleared instead of being held indefinitely
-// after a shortened or partially dropped UDP frame.
+// Packets are drained into an owned STAGING buffer and staging is copied to the
+// layer buffer each tick — hold-last-frame semantics. DDP additionally assembles
+// packets in a private back buffer and publishes to staging only on Push, so a
+// render tick can never expose a half-received frame to Preview/PARLIO/i80/RMT.
+// If Push is lost, offset zero starts a fresh assembly while the last complete
+// frame remains visible. The drain is non-blocking and bounded per tick (network
+// input is synchronous at the frame boundary — the architecture.md rule), so a
+// packet flood can't wedge the render loop. Sequence fields are ignored.
 //
 // Prior art: MoonLight's D_NetworkIn (single node, three protocols), WLED's
 // realtime UDP input (multi-port + per-packet validation, ArtPollReply), and
@@ -64,9 +63,7 @@ public:
         artnetSocket_.close();
         e131Socket_.close();
         ddpSocket_.close();
-        ddpRangeStart_ = 0;
-        ddpRangeEnd_ = 0;
-        ddpFrameComplete_ = false;
+        resetDdpState();
         MoonModule::release();
         clearStatus();
     }
@@ -85,12 +82,13 @@ public:
         } else {
             setStatus(kBindFailMsg, Severity::Error);
         }
-        // Size the staging buffer to the layer (one byte per channel byte). resize() reallocs
-        // (zero-filled) only when the byte count changes, frees on 0, and keeps dynamicBytes current.
-        staging_.resize(static_cast<size_t>(nrOfLights()) * channelsPerLight());
-        ddpRangeStart_ = 0;
-        ddpRangeEnd_ = 0;
-        ddpFrameComplete_ = false;
+        // Size the published staging buffer and DDP's private assembly buffer to
+        // the layer (one byte per channel byte). Both are allocated off the hot
+        // path and automatically accounted/freed by ScratchBuffer.
+        const size_t bytes = static_cast<size_t>(nrOfLights()) * channelsPerLight();
+        staging_.resize(bytes);
+        ddpAssembly_.resize(bytes);
+        resetDdpState();
     }
 
     void tick() override {
@@ -148,47 +146,45 @@ public:
                    data, len);
     }
 
-    // Apply one DDP packet and track the byte span owned by its frame. A push
-    // marks the next packet as a new frame; offset zero is the fallback boundary
-    // when a push packet was lost. At that boundary only the previous DDP span
-    // is cleared, so bytes the new frame does not rewrite become black without
-    // disturbing Art-Net/E1.31 data outside the DDP-owned range.
+    // Apply one DDP packet to the PRIVATE assembly buffer. The published staging
+    // buffer is changed only when Push completes the frame, which makes the
+    // handoff atomic from every output driver's point of view. Offset zero while
+    // a frame is already open abandons that incomplete frame (lost Push/packet)
+    // and starts clean while staging keeps showing the last complete frame.
+    //
+    // `ddpSawZero_` preserves a reordered first packet: if a non-zero offset
+    // arrives before offset zero, the later zero belongs to the same assembly
+    // instead of falsely discarding it.
     void applyDdp(uint32_t byteOffset, const uint8_t* data, uint16_t len, bool push) {
-        if (!staging_) return;
+        if (!staging_ || !ddpAssembly_) return;
         const size_t offset = static_cast<size_t>(byteOffset);
-        const bool hasRange = ddpRangeEnd_ > ddpRangeStart_;
-        if (ddpFrameComplete_ || (hasRange && offset == 0)) {
-            if (hasRange) {
-                std::memset(staging_.data() + ddpRangeStart_, 0,
-                            ddpRangeEnd_ - ddpRangeStart_);
-            }
-            ddpRangeStart_ = 0;
-            ddpRangeEnd_ = 0;
-            ddpFrameComplete_ = false;
-        }
+        if (!ddpFrameOpen_ || (offset == 0 && ddpSawZero_)) beginDdpFrame();
+        if (offset == 0) ddpSawZero_ = true;
 
-        if (offset < staging_.bytes()) {
+        if (offset < ddpAssembly_.bytes()) {
             size_t n = len;
-            const size_t available = staging_.bytes() - offset;
+            const size_t available = ddpAssembly_.bytes() - offset;
             if (n > available) n = available;
             if (n > 0) {
-                applyBytes(offset, data, static_cast<uint16_t>(n));
+                std::memcpy(ddpAssembly_.data() + offset, data, n);
                 const size_t end = offset + n;
-                if (ddpRangeEnd_ == ddpRangeStart_) {
-                    ddpRangeStart_ = offset;
-                    ddpRangeEnd_ = end;
+                if (ddpAssemblyEnd_ == ddpAssemblyStart_) {
+                    ddpAssemblyStart_ = offset;
+                    ddpAssemblyEnd_ = end;
                 } else {
-                    if (offset < ddpRangeStart_) ddpRangeStart_ = offset;
-                    if (end > ddpRangeEnd_) ddpRangeEnd_ = end;
+                    if (offset < ddpAssemblyStart_) ddpAssemblyStart_ = offset;
+                    if (end > ddpAssemblyEnd_) ddpAssemblyEnd_ = end;
                 }
             }
         }
-        if (push) ddpFrameComplete_ = true;
+        if (push) publishDdpFrame();
     }
 
-    // The one clamped write into staging (DDP's native addressing). The bound
-    // check runs BEFORE any addition so a hostile 32-bit offset can't overflow
-    // past it.
+    // The one clamped direct write into published staging, used by the
+    // universe protocols and placement tests. DDP uses the same byte addressing
+    // against ddpAssembly_ above, then publishes only at a complete-frame
+    // boundary. The bound check runs BEFORE any addition so a hostile offset
+    // can't overflow past it.
     void applyBytes(size_t offset, const uint8_t* data, uint16_t len) {
         if (!staging_ || offset >= staging_.bytes()) return;
         size_t n = len;
@@ -221,9 +217,63 @@ private:
     // Layer-buffer-sized staging (hold-last-frame). Self-sizing, self-freeing, self-reporting;
     // freed on disable via MoonModule::release() (the release() override chains to it).
     ScratchBuffer<uint8_t> staging_{*this};
-    size_t ddpRangeStart_ = 0;       // inclusive byte range written by the current DDP frame
-    size_t ddpRangeEnd_ = 0;         // exclusive; equal to start means no DDP range yet
-    bool ddpFrameComplete_ = false;  // push received; next DDP packet starts a fresh frame
+    // DDP writes here until Push, never into staging_. This second full-size
+    // buffer is the isolation boundary that prevents packet-level tearing.
+    ScratchBuffer<uint8_t> ddpAssembly_{*this};
+    size_t ddpAssemblyStart_ = 0;    // inclusive range written in the frame being assembled
+    size_t ddpAssemblyEnd_ = 0;      // exclusive; equal to start means no assembled bytes
+    size_t ddpPublishedStart_ = 0;   // inclusive range owned by the last published DDP frame
+    size_t ddpPublishedEnd_ = 0;     // exclusive; cleared when the next complete frame publishes
+    bool ddpFrameOpen_ = false;
+    bool ddpSawZero_ = false;
+
+    void resetDdpState() {
+        ddpAssemblyStart_ = 0;
+        ddpAssemblyEnd_ = 0;
+        ddpPublishedStart_ = 0;
+        ddpPublishedEnd_ = 0;
+        ddpFrameOpen_ = false;
+        ddpSawZero_ = false;
+    }
+
+    // Start assembling a new frame from black. Clearing the back buffer is
+    // deliberately done once per DDP frame, not once per render tick. It makes
+    // missing packets black in the eventual completed frame instead of leaking
+    // bytes from any older assembly.
+    void beginDdpFrame() {
+        std::memset(ddpAssembly_.data(), 0, ddpAssembly_.bytes());
+        ddpAssemblyStart_ = 0;
+        ddpAssemblyEnd_ = 0;
+        ddpFrameOpen_ = true;
+        ddpSawZero_ = false;
+    }
+
+    // Commit one complete DDP frame to the hold-last published buffer. This
+    // runs inside the effect tick before staging is copied to the layer, so no
+    // driver can observe the clear and copy as separate states.
+    void publishDdpFrame() {
+        if (!ddpFrameOpen_) return;
+        // A syntactically valid packet can still address wholly beyond this
+        // device's buffer. Do not let its Push black a valid displayed frame.
+        if (ddpAssemblyEnd_ == ddpAssemblyStart_) {
+            ddpFrameOpen_ = false;
+            ddpSawZero_ = false;
+            return;
+        }
+        if (ddpPublishedEnd_ > ddpPublishedStart_) {
+            std::memset(staging_.data() + ddpPublishedStart_, 0,
+                        ddpPublishedEnd_ - ddpPublishedStart_);
+        }
+        if (ddpAssemblyEnd_ > ddpAssemblyStart_) {
+            std::memcpy(staging_.data() + ddpAssemblyStart_,
+                        ddpAssembly_.data() + ddpAssemblyStart_,
+                        ddpAssemblyEnd_ - ddpAssemblyStart_);
+        }
+        ddpPublishedStart_ = ddpAssemblyStart_;
+        ddpPublishedEnd_ = ddpAssemblyEnd_;
+        ddpFrameOpen_ = false;
+        ddpSawZero_ = false;
+    }
 
     // Update the "receiving <protocol> from <ip>" diagnostic, but never clobber a bind error (its status is
     // the kBindFailMsg literal, so status() != recvStatus_). The common case is the same sender + protocol

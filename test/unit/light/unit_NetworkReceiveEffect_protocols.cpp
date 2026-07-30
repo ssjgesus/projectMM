@@ -140,16 +140,17 @@ TEST_CASE("DDP parse rejects malformed packets") {
     CHECK_FALSE(mm::parseDdpPacket(bad, len, offset, data, dataLen));
 }
 
-// A later DDP frame starts from black across the prior DDP-owned byte span.
-// This prevents a bright byte from sticking forever when a shorter frame or a
-// dropped UDP packet does not overwrite it.
-TEST_CASE("DDP frame boundary clears stale bytes not rewritten by the next frame") {
+// A complete DDP frame publishes atomically, and a later shorter frame starts
+// from black so bytes it does not rewrite cannot stick.
+TEST_CASE("DDP Push atomically publishes and clears stale bytes") {
     Rig r;
     uint8_t head[3] = {10, 20, 30};
     uint8_t tail[3] = {200, 210, 220};
 
     r.fx.applyDdp(0, head, sizeof(head), /*push=*/false);
+    CHECK(r.fx.stagingData()[0] == 0);       // partial frame is private
     r.fx.applyDdp(600, tail, sizeof(tail), /*push=*/true);
+    CHECK(r.fx.stagingData()[0] == 10);
     REQUIRE(r.fx.stagingData()[600] == 200);
 
     uint8_t nextHead[3] = {1, 2, 3};
@@ -158,20 +159,78 @@ TEST_CASE("DDP frame boundary clears stale bytes not rewritten by the next frame
     CHECK(r.fx.stagingData()[600] == 0);
 }
 
-// Offset zero is also a frame boundary when the previous push packet was lost.
-TEST_CASE("DDP offset zero clears a partial frame without a push") {
+// Offset zero abandons an incomplete frame when its Push was lost. Crucially,
+// the incomplete data is never published: the last complete frame holds until
+// another Push arrives.
+TEST_CASE("DDP missing Push discards partial frame and holds last complete frame") {
     Rig r;
+    uint8_t old[3] = {40, 41, 42};
+    r.fx.applyDdp(0, old, sizeof(old), /*push=*/true);
+    REQUIRE(r.fx.stagingData()[0] == 40);
+
     uint8_t first[3] = {90, 91, 92};
     uint8_t tail[3] = {190, 191, 192};
 
     r.fx.applyDdp(0, first, sizeof(first), /*push=*/false);
     r.fx.applyDdp(300, tail, sizeof(tail), /*push=*/false);
-    REQUIRE(r.fx.stagingData()[300] == 190);
+    CHECK(r.fx.stagingData()[0] == 40);
+    CHECK(r.fx.stagingData()[300] == 0);
 
     uint8_t next[3] = {7, 8, 9};
     r.fx.applyDdp(0, next, sizeof(next), /*push=*/false);
+    CHECK(r.fx.stagingData()[0] == 40);      // lost-Push frame was discarded
+    uint8_t nextTail[3] = {10, 11, 12};
+    r.fx.applyDdp(3, nextTail, sizeof(nextTail), /*push=*/true);
     CHECK(r.fx.stagingData()[0] == 7);
     CHECK(r.fx.stagingData()[300] == 0);
+}
+
+// The hardware-facing regression: while a multi-packet replacement frame is
+// only partly received, staging remains byte-identical to the prior complete
+// frame. PARLIO/i80 therefore cannot encode a torn half-old/half-new image.
+TEST_CASE("DDP partial replacement never tears the published frame") {
+    Rig r;
+    uint8_t oldHead[3] = {10, 20, 30};
+    uint8_t oldTail[3] = {40, 50, 60};
+    r.fx.applyDdp(0, oldHead, sizeof(oldHead), /*push=*/false);
+    r.fx.applyDdp(3, oldTail, sizeof(oldTail), /*push=*/true);
+    REQUIRE(std::memcmp(r.fx.stagingData(), oldHead, sizeof(oldHead)) == 0);
+    REQUIRE(std::memcmp(r.fx.stagingData() + 3, oldTail, sizeof(oldTail)) == 0);
+
+    uint8_t newHead[3] = {100, 110, 120};
+    r.fx.applyDdp(0, newHead, sizeof(newHead), /*push=*/false);
+    CHECK(std::memcmp(r.fx.stagingData(), oldHead, sizeof(oldHead)) == 0);
+    CHECK(std::memcmp(r.fx.stagingData() + 3, oldTail, sizeof(oldTail)) == 0);
+
+    uint8_t newTail[3] = {130, 140, 150};
+    r.fx.applyDdp(3, newTail, sizeof(newTail), /*push=*/true);
+    CHECK(std::memcmp(r.fx.stagingData(), newHead, sizeof(newHead)) == 0);
+    CHECK(std::memcmp(r.fx.stagingData() + 3, newTail, sizeof(newTail)) == 0);
+}
+
+// UDP may reorder the first two datagrams. A non-zero packet followed by offset
+// zero is still one frame until zero has already been seen.
+TEST_CASE("DDP accepts a reordered first packet without discarding it") {
+    Rig r;
+    uint8_t tail[3] = {40, 50, 60};
+    uint8_t head[3] = {10, 20, 30};
+    r.fx.applyDdp(3, tail, sizeof(tail), /*push=*/false);
+    r.fx.applyDdp(0, head, sizeof(head), /*push=*/true);
+    CHECK(std::memcmp(r.fx.stagingData(), head, sizeof(head)) == 0);
+    CHECK(std::memcmp(r.fx.stagingData() + 3, tail, sizeof(tail)) == 0);
+}
+
+// A valid-looking DDP packet addressed wholly beyond this device must not use
+// its Push flag to clear a good frame.
+TEST_CASE("DDP out-of-range Push does not black the published frame") {
+    Rig r;
+    uint8_t frame[3] = {10, 20, 30};
+    r.fx.applyDdp(0, frame, sizeof(frame), /*push=*/true);
+    REQUIRE(r.fx.stagingData()[0] == 10);
+
+    uint8_t foreign[3] = {200, 210, 220};
+    r.fx.applyDdp(100000, foreign, sizeof(foreign), /*push=*/true);
+    CHECK(r.fx.stagingData()[0] == 10);
 }
 
 // --- cross-protocol rejects -------------------------------------------------------
