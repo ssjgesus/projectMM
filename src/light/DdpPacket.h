@@ -33,8 +33,9 @@ constexpr uint8_t DDP_FLAG_PUSH = 0x01;
 constexpr size_t DDP_MAX_PAYLOAD = 1440;  // 480 RGB / 360 RGBW lights; divisible by 3 and 4
 
 // Build a DDP data packet. outBuf must be at least DDP_HEADER_SIZE + dataLen.
-// `push` marks the last packet of a frame (receivers that double-buffer show
-// the frame on push; ours streams into staging and doesn't need it).
+// `push` marks the last packet of a frame. NetworkReceiveEffect uses it to
+// identify the boundary before the next frame and clear bytes that would
+// otherwise retain stale values after a shortened or dropped packet.
 inline size_t buildDdpPacket(uint8_t* outBuf, uint32_t offset, bool push,
                              const uint8_t* data, uint16_t dataLen) {
     outBuf[0] = static_cast<uint8_t>(0x40 | (push ? DDP_FLAG_PUSH : 0x00));
@@ -52,10 +53,9 @@ inline size_t buildDdpPacket(uint8_t* outBuf, uint32_t offset, bool push,
 }
 
 // Parse + validate a DDP data packet: version bits and a declared length that
-// fits the datagram. Sequence, data type, destination and the push flag are
-// deliberately ignored (hold-last-frame staging makes push moot; last write
-// wins — the same stance as ArtNet's ignored sequence). dataOut points into
-// pkt (zero copy).
+// fits the datagram. Sequence, data type and destination are deliberately
+// ignored. The caller can inspect DDP_FLAG_PUSH in pkt[0] when it needs a frame
+// boundary; dataOut points into pkt (zero copy).
 inline bool parseDdpPacket(const uint8_t* pkt, size_t len, uint32_t& offsetOut,
                            const uint8_t*& dataOut, uint16_t& dataLenOut) {
     if (!pkt || len < DDP_HEADER_SIZE) return false;
