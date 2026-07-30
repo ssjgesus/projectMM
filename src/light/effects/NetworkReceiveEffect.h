@@ -27,12 +27,13 @@ namespace mm {
 //
 // Packets are drained into an owned STAGING buffer and staging is copied to the
 // layer buffer each tick — hold-last-frame semantics. DDP additionally assembles
-// packets in a private back buffer and publishes to staging only on Push, so a
-// render tick can never expose a half-received frame to Preview/PARLIO/i80/RMT.
-// If Push is lost, offset zero starts a fresh assembly while the last complete
-// frame remains visible. The drain is non-blocking and bounded per tick (network
-// input is synchronous at the frame boundary — the architecture.md rule), so a
-// packet flood can't wedge the render loop. Sequence fields are ignored.
+// packets in a private back buffer and publishes atomically on Push or when the
+// next offset-zero packet proves the prior frame has ended. A sender that omits
+// or sparsely uses Push therefore advances at its full frame rate with one frame
+// of latency, while Preview/PARLIO/i80/RMT never see a half-received frame. The
+// drain is non-blocking and bounded per tick (network input is synchronous at
+// the frame boundary — the architecture.md rule), so a packet flood can't wedge
+// the render loop. Sequence fields are ignored.
 //
 // Prior art: MoonLight's D_NetworkIn (single node, three protocols), WLED's
 // realtime UDP input (multi-port + per-packet validation, ArtPollReply), and
@@ -146,19 +147,26 @@ public:
                    data, len);
     }
 
-    // Apply one DDP packet to the PRIVATE assembly buffer. The published staging
-    // buffer is changed only when Push completes the frame, which makes the
-    // handoff atomic from every output driver's point of view. Offset zero while
-    // a frame is already open abandons that incomplete frame (lost Push/packet)
-    // and starts clean while staging keeps showing the last complete frame.
+    // Apply one DDP packet to the PRIVATE assembly buffer. Push publishes
+    // immediately. For senders that omit or sparsely use Push, the next
+    // offset-zero packet publishes the prior assembly before starting the new
+    // frame. This costs one frame of latency but keeps full frame rate and never
+    // exposes packet-level tearing to an output driver.
     //
     // `ddpSawZero_` preserves a reordered first packet: if a non-zero offset
     // arrives before offset zero, the later zero belongs to the same assembly
-    // instead of falsely discarding it.
+    // instead of falsely ending it.
     void applyDdp(uint32_t byteOffset, const uint8_t* data, uint16_t len, bool push) {
         if (!staging_ || !ddpAssembly_) return;
         const size_t offset = static_cast<size_t>(byteOffset);
-        if (!ddpFrameOpen_ || (offset == 0 && ddpSawZero_)) beginDdpFrame();
+        if (!ddpFrameOpen_) {
+            beginDdpFrame();
+        } else if (offset == 0 && ddpSawZero_) {
+            // The next frame has started. Commit the complete prior assembly
+            // atomically instead of discarding it while waiting for a rare Push.
+            publishDdpFrame();
+            beginDdpFrame();
+        }
         if (offset == 0) ddpSawZero_ = true;
 
         if (offset < ddpAssembly_.bytes()) {
