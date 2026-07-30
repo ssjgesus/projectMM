@@ -159,10 +159,10 @@ TEST_CASE("DDP Push atomically publishes and clears stale bytes") {
     CHECK(r.fx.stagingData()[600] == 0);
 }
 
-// Offset zero abandons an incomplete frame when its Push was lost. Crucially,
-// the incomplete data is never published: the last complete frame holds until
-// another Push arrives.
-TEST_CASE("DDP missing Push discards partial frame and holds last complete frame") {
+// Some DDP senders omit or sparsely use Push. The next offset-zero packet is
+// still an unambiguous frame boundary: it publishes the prior assembly, then
+// starts the replacement privately. This preserves full-rate atomic output.
+TEST_CASE("DDP offset zero publishes a complete no-Push frame") {
     Rig r;
     uint8_t old[3] = {40, 41, 42};
     r.fx.applyDdp(0, old, sizeof(old), /*push=*/true);
@@ -170,7 +170,6 @@ TEST_CASE("DDP missing Push discards partial frame and holds last complete frame
 
     uint8_t first[3] = {90, 91, 92};
     uint8_t tail[3] = {190, 191, 192};
-
     r.fx.applyDdp(0, first, sizeof(first), /*push=*/false);
     r.fx.applyDdp(300, tail, sizeof(tail), /*push=*/false);
     CHECK(r.fx.stagingData()[0] == 40);
@@ -178,11 +177,15 @@ TEST_CASE("DDP missing Push discards partial frame and holds last complete frame
 
     uint8_t next[3] = {7, 8, 9};
     r.fx.applyDdp(0, next, sizeof(next), /*push=*/false);
-    CHECK(r.fx.stagingData()[0] == 40);      // lost-Push frame was discarded
+    CHECK(r.fx.stagingData()[0] == 90);      // prior no-Push frame advanced
+    CHECK(r.fx.stagingData()[300] == 190);
+    CHECK(r.fx.stagingData()[3] == 0);       // replacement remains private
+
     uint8_t nextTail[3] = {10, 11, 12};
     r.fx.applyDdp(3, nextTail, sizeof(nextTail), /*push=*/true);
     CHECK(r.fx.stagingData()[0] == 7);
-    CHECK(r.fx.stagingData()[300] == 0);
+    CHECK(r.fx.stagingData()[3] == 10);
+    CHECK(r.fx.stagingData()[300] == 0);     // shorter completed frame clears tail
 }
 
 // The hardware-facing regression: while a multi-packet replacement frame is
