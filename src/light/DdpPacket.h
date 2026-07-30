@@ -29,6 +29,7 @@ namespace mm {
 
 constexpr uint16_t DDP_PORT = 4048;
 constexpr size_t DDP_HEADER_SIZE = 10;
+constexpr uint8_t DDP_FLAG_PUSH = 0x01;
 constexpr size_t DDP_MAX_PAYLOAD = 1440;  // 480 RGB / 360 RGBW lights; divisible by 3 and 4
 
 // Build a DDP data packet. outBuf must be at least DDP_HEADER_SIZE + dataLen.
@@ -36,7 +37,7 @@ constexpr size_t DDP_MAX_PAYLOAD = 1440;  // 480 RGB / 360 RGBW lights; divisibl
 // the frame on push; ours streams into staging and doesn't need it).
 inline size_t buildDdpPacket(uint8_t* outBuf, uint32_t offset, bool push,
                              const uint8_t* data, uint16_t dataLen) {
-    outBuf[0] = static_cast<uint8_t>(0x40 | (push ? 0x01 : 0x00));
+    outBuf[0] = static_cast<uint8_t>(0x40 | (push ? DDP_FLAG_PUSH : 0x00));
     outBuf[1] = 0;                       // sequence unused
     outBuf[2] = 0x01;                    // RGB
     outBuf[3] = 0x01;                    // default display
