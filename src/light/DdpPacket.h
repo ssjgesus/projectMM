@@ -33,9 +33,9 @@ constexpr uint8_t DDP_FLAG_PUSH = 0x01;
 constexpr size_t DDP_MAX_PAYLOAD = 1440;  // 480 RGB / 360 RGBW lights; divisible by 3 and 4
 
 // Build a DDP data packet. outBuf must be at least DDP_HEADER_SIZE + dataLen.
-// `push` marks the last packet of a frame. NetworkReceiveEffect uses it to
-// atomically publish the assembled frame; without Push an incomplete frame is
-// discarded at the next offset-zero boundary and the prior frame stays visible.
+// `push` marks the last packet of a frame. NetworkReceiveEffect publishes
+// immediately on Push; when a sender omits it, the next offset-zero packet
+// atomically publishes the prior frame before starting the replacement.
 inline size_t buildDdpPacket(uint8_t* outBuf, uint32_t offset, bool push,
                              const uint8_t* data, uint16_t dataLen) {
     outBuf[0] = static_cast<uint8_t>(0x40 | (push ? DDP_FLAG_PUSH : 0x00));
