@@ -107,7 +107,7 @@ TEST_CASE("DDP build→parse round-trip") {
     uint8_t pkt[mm::DDP_HEADER_SIZE + 6];
     const size_t len = mm::buildDdpPacket(pkt, 1440, /*push=*/true, payload, 6);
     REQUIRE(len == mm::DDP_HEADER_SIZE + 6);
-    CHECK((pkt[0] & 0x01) == 0x01);        // push flag on the last packet
+    CHECK((pkt[0] & mm::DDP_FLAG_PUSH) == mm::DDP_FLAG_PUSH); // push flag on the last packet
 
     uint32_t offset = 0;
     uint16_t dataLen = 0;
@@ -138,6 +138,40 @@ TEST_CASE("DDP parse rejects malformed packets") {
     std::memcpy(bad, pkt, len);
     bad[8] = 0x05; bad[9] = 0x00;           // declares 1280 bytes, datagram has 3
     CHECK_FALSE(mm::parseDdpPacket(bad, len, offset, data, dataLen));
+}
+
+// A later DDP frame starts from black across the prior DDP-owned byte span.
+// This prevents a bright byte from sticking forever when a shorter frame or a
+// dropped UDP packet does not overwrite it.
+TEST_CASE("DDP frame boundary clears stale bytes not rewritten by the next frame") {
+    Rig r;
+    uint8_t head[3] = {10, 20, 30};
+    uint8_t tail[3] = {200, 210, 220};
+
+    r.fx.applyDdp(0, head, sizeof(head), /*push=*/false);
+    r.fx.applyDdp(600, tail, sizeof(tail), /*push=*/true);
+    REQUIRE(r.fx.stagingData()[600] == 200);
+
+    uint8_t nextHead[3] = {1, 2, 3};
+    r.fx.applyDdp(0, nextHead, sizeof(nextHead), /*push=*/true);
+    CHECK(r.fx.stagingData()[0] == 1);
+    CHECK(r.fx.stagingData()[600] == 0);
+}
+
+// Offset zero is also a frame boundary when the previous push packet was lost.
+TEST_CASE("DDP offset zero clears a partial frame without a push") {
+    Rig r;
+    uint8_t first[3] = {90, 91, 92};
+    uint8_t tail[3] = {190, 191, 192};
+
+    r.fx.applyDdp(0, first, sizeof(first), /*push=*/false);
+    r.fx.applyDdp(300, tail, sizeof(tail), /*push=*/false);
+    REQUIRE(r.fx.stagingData()[300] == 190);
+
+    uint8_t next[3] = {7, 8, 9};
+    r.fx.applyDdp(0, next, sizeof(next), /*push=*/false);
+    CHECK(r.fx.stagingData()[0] == 7);
+    CHECK(r.fx.stagingData()[300] == 0);
 }
 
 // --- cross-protocol rejects -------------------------------------------------------
