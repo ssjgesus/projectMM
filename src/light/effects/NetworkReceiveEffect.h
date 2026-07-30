@@ -30,8 +30,10 @@ namespace mm {
 // buffer each tick — hold-last-frame semantics; without it the lights would
 // strobe black between frames. The drain is non-blocking and bounded per tick
 // (network input is synchronous at the frame boundary — the architecture.md
-// rule), so a packet flood can't wedge the render loop. Sequence fields (and
-// DDP's push flag) are ignored: last write wins into staging.
+// rule), so a packet flood can't wedge the render loop. Sequence fields are
+// ignored. DDP frame boundaries use offset zero and the push flag so bytes not
+// refreshed by a later frame are cleared instead of being held indefinitely
+// after a shortened or partially dropped UDP frame.
 //
 // Prior art: MoonLight's D_NetworkIn (single node, three protocols), WLED's
 // realtime UDP input (multi-port + per-packet validation, ArtPollReply), and
@@ -62,6 +64,9 @@ public:
         artnetSocket_.close();
         e131Socket_.close();
         ddpSocket_.close();
+        ddpRangeStart_ = 0;
+        ddpRangeEnd_ = 0;
+        ddpFrameComplete_ = false;
         MoonModule::release();
         clearStatus();
     }
@@ -83,6 +88,9 @@ public:
         // Size the staging buffer to the layer (one byte per channel byte). resize() reallocs
         // (zero-filled) only when the byte count changes, frees on 0, and keeps dynamicBytes current.
         staging_.resize(static_cast<size_t>(nrOfLights()) * channelsPerLight());
+        ddpRangeStart_ = 0;
+        ddpRangeEnd_ = 0;
+        ddpFrameComplete_ = false;
     }
 
     void tick() override {
@@ -116,7 +124,7 @@ public:
             const int n = ddpSocket_.recvFrom(pkt_, sizeof(pkt_), srcIp);
             if (n <= 0) break;
             if (parseDdpPacket(pkt_, static_cast<size_t>(n), byteOffset, data, dataLen)) {
-                applyBytes(byteOffset, data, dataLen);
+                applyDdp(byteOffset, data, dataLen, (pkt_[0] & DDP_FLAG_PUSH) != 0);
                 noteReceiving("DDP", srcIp);
             }
         }
@@ -138,6 +146,44 @@ public:
         if (len > channelsPerUniverse) len = channelsPerUniverse;
         applyBytes(static_cast<size_t>(universe - universeStart) * channelsPerUniverse,
                    data, len);
+    }
+
+    // Apply one DDP packet and track the byte span owned by its frame. A push
+    // marks the next packet as a new frame; offset zero is the fallback boundary
+    // when a push packet was lost. At that boundary only the previous DDP span
+    // is cleared, so bytes the new frame does not rewrite become black without
+    // disturbing Art-Net/E1.31 data outside the DDP-owned range.
+    void applyDdp(uint32_t byteOffset, const uint8_t* data, uint16_t len, bool push) {
+        if (!staging_) return;
+        const size_t offset = static_cast<size_t>(byteOffset);
+        const bool hasRange = ddpRangeEnd_ > ddpRangeStart_;
+        if (ddpFrameComplete_ || (hasRange && offset == 0)) {
+            if (hasRange) {
+                std::memset(staging_.data() + ddpRangeStart_, 0,
+                            ddpRangeEnd_ - ddpRangeStart_);
+            }
+            ddpRangeStart_ = 0;
+            ddpRangeEnd_ = 0;
+            ddpFrameComplete_ = false;
+        }
+
+        if (offset < staging_.bytes()) {
+            size_t n = len;
+            const size_t available = staging_.bytes() - offset;
+            if (n > available) n = available;
+            if (n > 0) {
+                applyBytes(offset, data, static_cast<uint16_t>(n));
+                const size_t end = offset + n;
+                if (ddpRangeEnd_ == ddpRangeStart_) {
+                    ddpRangeStart_ = offset;
+                    ddpRangeEnd_ = end;
+                } else {
+                    if (offset < ddpRangeStart_) ddpRangeStart_ = offset;
+                    if (end > ddpRangeEnd_) ddpRangeEnd_ = end;
+                }
+            }
+        }
+        if (push) ddpFrameComplete_ = true;
     }
 
     // The one clamped write into staging (DDP's native addressing). The bound
@@ -175,6 +221,9 @@ private:
     // Layer-buffer-sized staging (hold-last-frame). Self-sizing, self-freeing, self-reporting;
     // freed on disable via MoonModule::release() (the release() override chains to it).
     ScratchBuffer<uint8_t> staging_{*this};
+    size_t ddpRangeStart_ = 0;       // inclusive byte range written by the current DDP frame
+    size_t ddpRangeEnd_ = 0;         // exclusive; equal to start means no DDP range yet
+    bool ddpFrameComplete_ = false;  // push received; next DDP packet starts a fresh frame
 
     // Update the "receiving <protocol> from <ip>" diagnostic, but never clobber a bind error (its status is
     // the kBindFailMsg literal, so status() != recvStatus_). The common case is the same sender + protocol

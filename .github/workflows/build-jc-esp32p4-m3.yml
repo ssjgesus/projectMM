@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - agent/jc-esp32p4-m3-audio
+      - agent/build-jc-ddp-frame-clearing
 
 permissions:
   contents: read
@@ -42,5 +43,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: projectMM-esp32p4-jc-m3-eth
+          name: projectMM-esp32p4-jc-m3-ddp-fix
           path: dist/
